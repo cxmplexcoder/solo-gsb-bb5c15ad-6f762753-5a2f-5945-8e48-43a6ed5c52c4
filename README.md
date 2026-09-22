@@ -45,6 +45,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/v1/leases/acquire` | 申请租约，成功 200 / 被占用 409 |
+| POST | `/v1/leases/acquire-batch` | 批量申请 2～32 个租约，全成全败，冲突返回全部冲突键 |
 | POST | `/v1/leases/renew` | 续租，成功 200 / 失败 409（reason: `not_found` / `conflict` / `expired`） |
 | POST | `/v1/leases/release` | 释放租约（幂等，始终 200） |
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
@@ -79,10 +80,52 @@ curl -s -X POST localhost:8000/v1/leases/release \
   -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1}'
 ```
 
+### 批量申请（全成全败）
+
+`POST /v1/leases/acquire-batch` 一次原子申请 **2～32 个互不重复**任务键的租约，
+全批共用一个 `ttl_ms`：
+
+- **全部成功**：按输入顺序返回每个任务**独立的 token 与 fencing_token**；
+  所有 `expires_at_ms` 基于脚本内同一次 `TIME` 计算，因此全批相同。
+- **任一冲突**：返回 409 与**全部**仍被占用的任务键（`conflicts`），
+  不创建任何租约、不递增任何防栅计数器（失败的批量请求不会"消耗"序号）。
+- 已过期的租约视为可用、可被批量接管（接管时该任务的 fencing 照常 +1）。
+- 返回的凭据与单个申请接口完全相同，可直接用于 `renew` / `release` / `validate`。
+
+```bash
+# 一次申请 3 个任务，统一 TTL 5 秒
+curl -s -X POST localhost:8000/v1/leases/acquire-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"task_keys": ["report:daily", "report:weekly", "report:monthly"], "ttl_ms": 5000}'
+# => 200
+# {
+#   "acquired": true,
+#   "leases": [
+#     {"task_key": "report:daily",   "token": "a1b2...", "fencing_token": 1, "expires_at_ms": 1758580000000},
+#     {"task_key": "report:weekly",  "token": "c3d4...", "fencing_token": 1, "expires_at_ms": 1758580000000},
+#     {"task_key": "report:monthly", "token": "e5f6...", "fencing_token": 1, "expires_at_ms": 1758580000000}
+#   ],
+#   "conflicts": []
+# }
+
+# 若 report:weekly 仍被他人持有 => 409，且其余键（含空闲键）零副作用
+# {
+#   "acquired": false,
+#   "leases": [],
+#   "conflicts": ["report:weekly"]
+# }
+
+# task_keys 少于 2 个、多于 32 个或存在重复时 => 422
+```
+
 ## 设计要点
 
-- **原子性**：申请 / 续租 / 释放 / 校验四个状态转换全部由 Redis Lua 脚本
-  （`app/lua.py`）在服务端原子执行，不存在"检查后修改"的竞态窗口。
+- **原子性**：单个申请 / 批量申请 / 续租 / 释放 / 校验的状态转换全部由 Redis
+  Lua 脚本（`app/lua.py`）在服务端原子执行，不存在"检查后修改"的竞态窗口。
+  批量申请采用"先只读检查全部键、再统一写入"两阶段逻辑：任一任务仍被占用时
+  直接返回，脚本未发出任何写命令，因此不会创建租约，也不会 INCR 任何防栅计数器。
+- **批量请求共用一次 TIME**：批量脚本开头只调用一次 `TIME`，所有租约的
+  `expires_at_ms` 由同一基准计算（全批相同），避免逐个申请产生的时间漂移。
 - **过期判断使用 Redis 服务器时间**：Lua 内通过 `TIME` 命令取 Redis 服务器时钟，
   不依赖各客户端本地时间，避免时钟漂移导致的误判。
 - **防栅序号单调递增**：每个任务键对应一个独立的 `INCR` 计数器键且**永不过期**，
@@ -106,10 +149,12 @@ curl -s -X POST localhost:8000/v1/leases/release \
 
 ```bash
 python3 scripts/smoke_test.py            # 默认打 http://localhost:8000
+python3 scripts/smoke_test_batch.py      # acquire-batch 专项（全成全败/过期接管/凭据兼容）
 ```
 
-覆盖：获取冲突、错误令牌/序号被拒绝、防栅序号单调递增、旧持有者超时后无法
-续租/释放/干扰新租约等场景。
+第一个脚本覆盖：获取冲突、错误令牌/序号被拒绝、防栅序号单调递增、旧持有者超时后无法
+续租/释放/干扰新租约等场景。第二个脚本覆盖：批量成功、冲突时零副作用（不建租约、
+不递增任何计数器）、过期租约被批量接管、批量凭据兼容续租/释放/校验等场景。
 
 ## 本地开发（不用 Docker）
 
@@ -125,11 +170,12 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py    # 环境变量配置（pydantic-settings）
-  lua.py       # 申请/续租/释放/校验四个原子 Lua 脚本
+  lua.py       # 单个/批量申请、续租、释放、校验五个原子 Lua 脚本
   schemas.py   # 请求 / 响应模型
   main.py      # FastAPI 应用、路由、Redis 生命周期
 scripts/
   smoke_test.py
+  smoke_test_batch.py
 Dockerfile
 docker-compose.yml
 requirements.txt

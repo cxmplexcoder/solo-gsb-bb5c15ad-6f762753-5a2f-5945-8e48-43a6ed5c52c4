@@ -33,6 +33,52 @@ redis.call('PEXPIRE', KEYS[1], ttl)
 return {1, fencing, now + ttl}
 """
 
+# 批量申请租约（全成全败）：所有任务键均未被占用（或旧租约已过期）时，
+# 才一次性创建全部租约；任一冲突则不做任何写操作。
+# 脚本开头只调用一次 TIME，全部租约共用同一基准 now 与相同的 expires_at。
+# KEYS[1..n]     = 租约键（与入参顺序一致）
+# KEYS[n+1..2n]  = 防栅计数器键
+# ARGV[1..n]     = 各任务的新令牌, ARGV[n+1] = ttl_ms
+# 成功返回 {1, fence1..fenceN, expires_at}
+# 冲突返回 {0, 冲突下标1..}（下标从 1 开始，对应入参顺序）
+ACQUIRE_BATCH_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local n = #KEYS / 2
+local ttl = tonumber(ARGV[n + 1])
+
+-- 阶段一：只读检查，收集全部仍被占用的任务下标
+local conflicts = {}
+for i = 1, n do
+  local expires_at = redis.call('HGET', KEYS[i], 'expires_at')
+  if expires_at and tonumber(expires_at) > now then
+    conflicts[#conflicts + 1] = i
+  end
+end
+if #conflicts > 0 then
+  local reply = {0}
+  for i = 1, #conflicts do
+    reply[i + 1] = conflicts[i]
+  end
+  return reply
+end
+
+-- 阶段二：全部可用，按输入顺序逐个 INCR / HSET（整批原子，外部不可见中间态）
+local expires = now + ttl
+local reply = {1}
+for i = 1, n do
+  local fencing = redis.call('INCR', KEYS[n + i])
+  redis.call('HSET', KEYS[i],
+    'token', ARGV[i],
+    'fencing', fencing,
+    'expires_at', expires)
+  redis.call('PEXPIRE', KEYS[i], ttl)
+  reply[i + 1] = fencing
+end
+reply[n + 2] = expires
+return reply
+"""
+
 # 续租：必须同时匹配令牌与防栅序号，且租约尚未过期。
 # 已过期的租约不允许续租（持有者必须重新申请），
 # 防止旧持有者在超时后"复活"自己的租约。
