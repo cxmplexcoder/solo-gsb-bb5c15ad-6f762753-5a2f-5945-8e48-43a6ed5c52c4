@@ -1,5 +1,12 @@
 """API 请求 / 响应模型。"""
-from pydantic import BaseModel, Field
+from typing import Annotated
+
+from pydantic import BaseModel, Field, field_validator
+
+BATCH_MIN_SIZE = 2
+BATCH_MAX_SIZE = 32
+
+TaskKey = Annotated[str, Field(min_length=1, max_length=512)]
 
 
 class AcquireRequest(BaseModel):
@@ -20,6 +27,50 @@ class AcquireResponse(BaseModel):
     )
     expires_at_ms: int | None = Field(
         default=None, description="过期时间（Redis 服务器时钟，Unix 毫秒）"
+    )
+
+
+class AcquireBatchRequest(BaseModel):
+    task_keys: list[TaskKey] = Field(
+        min_length=BATCH_MIN_SIZE,
+        max_length=BATCH_MAX_SIZE,
+        examples=[["video-transcode:order-123", "video-transcode:order-456"]],
+        description=(
+            f"一批任务键，{BATCH_MIN_SIZE}～{BATCH_MAX_SIZE} 个且不允许重复"
+        ),
+    )
+    ttl_ms: int | None = Field(
+        default=None, gt=0, description="统一租约 TTL（毫秒），缺省使用服务端默认值"
+    )
+
+    @field_validator("task_keys")
+    @classmethod
+    def reject_duplicates(cls, v: list[str]) -> list[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("task_keys must be unique")
+        return v
+
+
+class AcquiredLease(BaseModel):
+    """批量申请结果中的单个任务凭据，顺序与请求的 task_keys 一致。"""
+
+    task_key: str
+    token: str = Field(description="所有权令牌")
+    fencing_token: int = Field(description="防栅序号，单调递增")
+    expires_at_ms: int = Field(
+        description="过期时间（Redis 服务器时钟，Unix 毫秒），整批同一基准"
+    )
+
+
+class AcquireBatchResponse(BaseModel):
+    acquired: bool
+    leases: list[AcquiredLease] = Field(
+        default_factory=list,
+        description="全部成功时每个任务的独立凭据，按输入顺序返回",
+    )
+    conflicting_task_keys: list[str] = Field(
+        default_factory=list,
+        description="冲突时仍被占用的任务键（全部冲突键，按输入顺序）",
     )
 
 

@@ -45,6 +45,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/v1/leases/acquire` | 申请租约，成功 200 / 被占用 409 |
+| POST | `/v1/leases/acquire-batch` | 批量申请 2～32 个不重复任务键（统一 TTL），全成全败 |
 | POST | `/v1/leases/renew` | 续租，成功 200 / 失败 409（reason: `not_found` / `conflict` / `expired`） |
 | POST | `/v1/leases/release` | 释放租约（幂等，始终 200） |
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
@@ -62,18 +63,36 @@ curl -s -X POST localhost:8000/v1/leases/acquire \
 
 # 占用期间他人申请 => 409 {"acquired":false,...}
 
-# 2. 续租（必须同时带上令牌与防栅序号）
+# 2. 批量申请（2～32 个不重复 task_key，统一 TTL，全成全败）
+curl -s -X POST localhost:8000/v1/leases/acquire-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"task_keys": ["report:daily", "report:weekly", "report:monthly"], "ttl_ms": 5000}'
+# 成功 200（leases 顺序与请求一致；expires_at_ms 为同一次服务器 TIME 的基准）：
+# => {"acquired":true,"leases":[
+#   {"task_key":"report:daily","token":"a1b2...","fencing_token":1,"expires_at_ms":1758...},
+#   {"task_key":"report:weekly","token":"c3d4...","fencing_token":1,"expires_at_ms":1758...},
+#   {"task_key":"report:monthly","token":"e5f6...","fencing_token":1,"expires_at_ms":1758...}
+# ],"conflicting_task_keys":[]}
+#
+# 任一任务仍被占用 => 409，返回全部冲突键，不创建任何租约、不递增任何防栅计数器：
+# => {"acquired":false,"leases":[],"conflicting_task_keys":["report:weekly"]}
+#
+# 过期租约与不存在的键同样视为可用，可被批量接管。
+# 批量所得 (token, fencing_token) 与单个申请完全等价，
+# 可直接用于下面的续租 / 校验 / 释放接口（每个任务键独立调用）。
+
+# 3. 续租（必须同时带上令牌与防栅序号）
 curl -s -X POST localhost:8000/v1/leases/renew \
   -H 'Content-Type: application/json' \
   -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1, "ttl_ms": 5000}'
 
-# 3. 下游校验某次操作是否仍属当前租约
+# 4. 下游校验某次操作是否仍属当前租约
 curl -s -X POST localhost:8000/v1/leases/validate \
   -H 'Content-Type: application/json' \
   -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1}'
 # => {"valid":true,"remaining_ms":4210}
 
-# 4. 释放租约
+# 5. 释放租约
 curl -s -X POST localhost:8000/v1/leases/release \
   -H 'Content-Type: application/json' \
   -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1}'
@@ -81,10 +100,13 @@ curl -s -X POST localhost:8000/v1/leases/release \
 
 ## 设计要点
 
-- **原子性**：申请 / 续租 / 释放 / 校验四个状态转换全部由 Redis Lua 脚本
-  （`app/lua.py`）在服务端原子执行，不存在"检查后修改"的竞态窗口。
+- **原子性**：申请 / 批量申请 / 续租 / 释放 / 校验全部状态转换均由 Redis Lua 脚本
+  （`app/lua.py`）在服务端原子执行，不存在"检查后修改"的竞态窗口。批量申请在同一
+  脚本内先检查全部任务、再统一写入，任一任务被占用则整体失败——不创建任何租约，
+  也不递增任何防栅计数器（全成全败）；过期租约可被接管。
 - **过期判断使用 Redis 服务器时间**：Lua 内通过 `TIME` 命令取 Redis 服务器时钟，
-  不依赖各客户端本地时间，避免时钟漂移导致的误判。
+  不依赖各客户端本地时间，避免时钟漂移导致的误判。批量脚本只调用一次 `TIME`，
+  整批租约的 `expires_at_ms` 基于同一时刻计算。
 - **防栅序号单调递增**：每个任务键对应一个独立的 `INCR` 计数器键且**永不过期**，
   即使租约键被 TTL 清除，序号也不会回退或复用。下游系统可用它拒绝迟到的旧操作
   （fencing token 经典用法）。
@@ -125,7 +147,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py    # 环境变量配置（pydantic-settings）
-  lua.py       # 申请/续租/释放/校验四个原子 Lua 脚本
+  lua.py       # 申请/批量申请/续租/释放/校验五个原子 Lua 脚本
   schemas.py   # 请求 / 响应模型
   main.py      # FastAPI 应用、路由、Redis 生命周期
 scripts/

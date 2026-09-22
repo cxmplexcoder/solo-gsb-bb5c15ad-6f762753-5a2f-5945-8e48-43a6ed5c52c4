@@ -16,8 +16,17 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from .config import Settings, get_settings
-from .lua import ACQUIRE_LUA, RELEASE_LUA, RENEW_LUA, VALIDATE_LUA
+from .lua import (
+    ACQUIRE_BATCH_LUA,
+    ACQUIRE_LUA,
+    RELEASE_LUA,
+    RENEW_LUA,
+    VALIDATE_LUA,
+)
 from .schemas import (
+    AcquireBatchRequest,
+    AcquireBatchResponse,
+    AcquiredLease,
     AcquireRequest,
     AcquireResponse,
     LeaseStateResponse,
@@ -38,6 +47,7 @@ async def lifespan(app: FastAPI):
     # 启动时注册 Lua 脚本（EVALSHA 执行，脚本不存在时客户端自动回退 EVAL）
     app.state.scripts = SimpleNamespace(
         acquire=redis.register_script(ACQUIRE_LUA),
+        acquire_batch=redis.register_script(ACQUIRE_BATCH_LUA),
         renew=redis.register_script(RENEW_LUA),
         release=redis.register_script(RELEASE_LUA),
         validate=redis.register_script(VALIDATE_LUA),
@@ -138,6 +148,53 @@ async def acquire(
         task_key=req.task_key,
         fencing_token=fencing,
         expires_at_ms=expires_at,
+    )
+
+
+@app.post(
+    "/v1/leases/acquire-batch",
+    response_model=AcquireBatchResponse,
+)
+async def acquire_batch(
+    req: AcquireBatchRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> AcquireBatchResponse:
+    """批量申请租约（2～32 个不重复任务键，统一 TTL），全成全败。
+
+    由单个 Lua 脚本、单次服务器 TIME 原子完成：任一任务仍被有效租约占用时
+    返回 409 及全部冲突键，不创建任何租约、不递增任何防栅计数器；
+    全部可用（含旧租约已过期可接管）时，按输入顺序返回每个任务独立的
+    token、递增的 fencing_token 与同一基准计算的 expires_at_ms。
+    所得凭据可直接用于现有的续租 / 释放 / 校验接口。
+    """
+    ttl = resolve_ttl(req.ttl_ms, settings)
+    tokens = [uuid.uuid4().hex for _ in req.task_keys]
+    lease_keys = [lease_key(settings, k) for k in req.task_keys]
+    fencer_keys = [fencing_key(settings, k) for k in req.task_keys]
+
+    result = await scripts.acquire_batch(
+        keys=lease_keys + fencer_keys,
+        args=[str(len(req.task_keys)), *tokens, str(ttl)],
+    )
+
+    if result[0]:
+        leases = [
+            AcquiredLease(
+                task_key=req.task_keys[i],
+                token=tokens[i],
+                fencing_token=result[1 + 2 * i],
+                expires_at_ms=result[2 + 2 * i],
+            )
+            for i in range(len(req.task_keys))
+        ]
+        return AcquireBatchResponse(acquired=True, leases=leases)
+
+    conflicting = [req.task_keys[idx - 1] for idx in result[1:]]
+    response.status_code = status.HTTP_409_CONFLICT
+    return AcquireBatchResponse(
+        acquired=False, conflicting_task_keys=conflicting
     )
 
 
